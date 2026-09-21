@@ -1,12 +1,11 @@
 {
   "name": "unityroom-proxy",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "express": "^5.1.0",
-    "http-proxy-middleware": "^3.0.5"
+  "engines": {
+    "node": ">=20 <25"
   }
 }

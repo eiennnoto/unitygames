@@ -1,407 +1,816 @@
-const http = require("http");
-const { URL } = require("url");
+import express from 'express';
+import http from 'node:http';
+import { Readable } from 'node:stream';
+import httpProxy from 'http-proxy';
+import * as cheerio from 'cheerio';
 
-const PORT = process.env.PORT || 10000;
+const app = express();
+app.set('trust proxy', true);
 
-// 最初に表示するサイト
-const HOME = "https://unityroom.com/";
+// オープンプロキシにならないよう、unityroom系だけ許可
+const ALLOWED_HOSTS = [
+  'unityroom.com',
+  ...(process.env.EXTRA_ALLOWED_HOSTS || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean),
+];
 
-// 許可するホスト
 function isAllowedHost(hostname) {
-    hostname = hostname.toLowerCase();
+  const h = hostname.toLowerCase().replace(/\.$/, '');
 
-    // unityroom.com
-    if (hostname === "unityroom.com") {
-        return true;
-    }
+  return ALLOWED_HOSTS.some(
+    base => h === base || h.endsWith(`.${base}`)
+  );
+}
 
-    // www.unityroom.com
-    if (hostname === "www.unityroom.com") {
-        return true;
-    }
+function getPublicOrigin(req) {
+  const proto =
+    req.headers['x-forwarded-proto']?.split(',')[0]?.trim() ||
+    req.protocol ||
+    'https';
 
-    // 78914.play.unityroom.com
-    // abc.play.unityroom.com
-    if (hostname.endsWith(".play.unityroom.com")) {
-        return true;
-    }
+  return `${proto}://${req.get('host')}`;
+}
 
+// /__p/ホスト名/パス を本来のURLに戻す
+function parseProxyTarget(req) {
+  const prefix = '/__p/';
+  const original = req.originalUrl;
+
+  if (!original.startsWith(prefix)) {
+    return null;
+  }
+
+  const after = original.slice(prefix.length);
+
+  const slash = after.indexOf('/');
+
+  const encodedHost =
+    slash === -1
+      ? after
+      : after.slice(0, slash);
+
+  const rawPath =
+    slash === -1
+      ? '/'
+      : after.slice(slash);
+
+  let hostname;
+
+  try {
+    hostname = decodeURIComponent(encodedHost);
+  } catch {
+    return null;
+  }
+
+  if (!/^[a-z0-9.-]+$/i.test(hostname)) {
+    return null;
+  }
+
+  if (!isAllowedHost(hostname)) {
+    return null;
+  }
+
+  try {
+    const target = new URL(
+      `https://${hostname}${rawPath}`
+    );
+
+    target.hash = '';
+
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+// 本来のURL → Render側URL
+function proxyUrl(target, publicOrigin) {
+  let path = target.pathname || '/';
+
+  if (!path.startsWith('/')) {
+    path = '/' + path;
+  }
+
+  return (
+    `${publicOrigin}/__p/` +
+    `${target.hostname}` +
+    `${path}` +
+    `${target.search}` +
+    `${target.hash}`
+  );
+}
+
+function shouldRewriteUrl(raw) {
+  if (!raw) return false;
+
+  const s = raw.trim();
+
+  if (
+    !s ||
+    s.startsWith('#') ||
+    s.startsWith('data:') ||
+    s.startsWith('blob:') ||
+    s.startsWith('javascript:') ||
+    s.startsWith('mailto:') ||
+    s.startsWith('tel:')
+  ) {
     return false;
+  }
+
+  return true;
 }
 
-// URLをRenderプロキシURLへ変換
-function proxyUrl(target) {
-    return "/proxy?url=" + encodeURIComponent(target);
+function rewriteUrl(raw, pageUrl, publicOrigin) {
+  if (!shouldRewriteUrl(raw)) {
+    return raw;
+  }
+
+  try {
+    const u = new URL(raw, pageUrl);
+
+    if (
+      u.protocol !== 'http:' &&
+      u.protocol !== 'https:'
+    ) {
+      return raw;
+    }
+
+    if (!isAllowedHost(u.hostname)) {
+      return raw;
+    }
+
+    return proxyUrl(
+      u,
+      publicOrigin
+    );
+  } catch {
+    return raw;
+  }
 }
 
-// HTML内のURLを書き換える
-function rewriteHtml(html, baseUrl) {
-    const base = new URL(baseUrl);
+function rewriteSrcset(
+  value,
+  pageUrl,
+  publicOrigin
+) {
+  return value
+    .split(',')
+    .map(part => {
+      const trimmed = part.trim();
 
-    // src / href / action / poster / data
-    html = html.replace(
-        /(\b(?:src|href|action|poster|data)\s*=\s*)(["'])([^"']+)\2/gi,
-        (match, prefix, quote, value) => {
+      if (!trimmed) return part;
 
-            if (
-                value.startsWith("#") ||
-                value.startsWith("data:") ||
-                value.startsWith("blob:") ||
-                value.startsWith("javascript:") ||
-                value.startsWith("mailto:")
-            ) {
-                return match;
-            }
+      const match =
+        trimmed.match(/^(\S+)(\s+.*)?$/);
 
-            try {
-                const absolute = new URL(value, base);
+      if (!match) return part;
 
-                if (!isAllowedHost(absolute.hostname)) {
-                    return match;
-                }
-
-                return (
-                    prefix +
-                    quote +
-                    proxyUrl(absolute.href) +
-                    quote
-                );
-
-            } catch {
-                return match;
-            }
-        }
-    );
-
-    // srcset
-    html = html.replace(
-        /(\bsrcset\s*=\s*)(["'])([^"']+)\2/gi,
-        (match, prefix, quote, value) => {
-
-            const result = value.split(",").map(item => {
-                const parts = item.trim().split(/\s+/);
-
-                if (!parts[0]) {
-                    return item;
-                }
-
-                try {
-                    const absolute = new URL(parts[0], base);
-
-                    if (!isAllowedHost(absolute.hostname)) {
-                        return item;
-                    }
-
-                    parts[0] = proxyUrl(absolute.href);
-
-                    return parts.join(" ");
-                } catch {
-                    return item;
-                }
-            });
-
-            return prefix + quote + result.join(", ") + quote;
-        }
-    );
-
-    // CSS url(...)
-    html = html.replace(
-        /url\(\s*(["']?)([^"')]+)\1\s*\)/gi,
-        (match, quote, value) => {
-
-            try {
-                const absolute = new URL(value, base);
-
-                if (!isAllowedHost(absolute.hostname)) {
-                    return match;
-                }
-
-                return `url("${proxyUrl(absolute.href)}")`;
-
-            } catch {
-                return match;
-            }
-        }
-    );
-
-    return html;
+      return (
+        rewriteUrl(
+          match[1],
+          pageUrl,
+          publicOrigin
+        ) +
+        (match[2] || '')
+      );
+    })
+    .join(', ');
 }
 
-// CSS内のURLを書き換える
-function rewriteCss(css, baseUrl) {
-    const base = new URL(baseUrl);
+function rewriteCss(
+  css,
+  pageUrl,
+  publicOrigin
+) {
+  return css.replace(
+    /url\(\s*(["']?)([^"')]+)\1\s*\)/gi,
+    (full, quote, rawUrl) => {
+      const rewritten = rewriteUrl(
+        rawUrl,
+        pageUrl,
+        publicOrigin
+      );
 
-    return css.replace(
-        /url\(\s*(["']?)([^"')]+)\1\s*\)/gi,
-        (match, quote, value) => {
-
-            if (
-                value.startsWith("data:") ||
-                value.startsWith("#")
-            ) {
-                return match;
-            }
-
-            try {
-                const absolute = new URL(value, base);
-
-                if (!isAllowedHost(absolute.hostname)) {
-                    return match;
-                }
-
-                return `url("${proxyUrl(absolute.href)}")`;
-            } catch {
-                return match;
-            }
-        }
-    );
+      return `url(${quote}${rewritten}${quote})`;
+    }
+  );
 }
 
-// HTTPサーバー
-const server = http.createServer(async (req, res) => {
+function rewriteHtml(
+  html,
+  pageUrl,
+  publicOrigin
+) {
+  const $ = cheerio.load(
+    html,
+    {
+      decodeEntities: false
+    }
+  );
 
+  const attrs = [
+    'href',
+    'src',
+    'action',
+    'poster',
+    'data',
+    'cite',
+    'formaction',
+    'manifest',
+    'background',
+    'profile'
+  ];
+
+  for (const attr of attrs) {
+    $(`[${attr}]`).each((_, el) => {
+      const value = $(el).attr(attr);
+
+      if (value) {
+        $(el).attr(
+          attr,
+          rewriteUrl(
+            value,
+            pageUrl,
+            publicOrigin
+          )
+        );
+      }
+    });
+  }
+
+  $('[srcset]').each((_, el) => {
+    const value = $(el).attr('srcset');
+
+    if (value) {
+      $(el).attr(
+        'srcset',
+        rewriteSrcset(
+          value,
+          pageUrl,
+          publicOrigin
+        )
+      );
+    }
+  });
+
+  $('[style]').each((_, el) => {
+    const value = $(el).attr('style');
+
+    if (value) {
+      $(el).attr(
+        'style',
+        rewriteCss(
+          value,
+          pageUrl,
+          publicOrigin
+        )
+      );
+    }
+  });
+
+  $('style').each((_, el) => {
+    const value = $(el).html();
+
+    if (value) {
+      $(el).html(
+        rewriteCss(
+          value,
+          pageUrl,
+          publicOrigin
+        )
+      );
+    }
+  });
+
+  // meta refresh
+  $('meta[http-equiv]').each((_, el) => {
+    const equiv =
+      ($(el).attr('http-equiv') || '')
+        .toLowerCase();
+
+    if (equiv !== 'refresh') {
+      return;
+    }
+
+    const content =
+      $(el).attr('content');
+
+    if (!content) return;
+
+    $(el).attr(
+      'content',
+      content.replace(
+        /(url\s*=\s*)(.+)$/i,
+        (_, p1, p2) => {
+          return (
+            p1 +
+            rewriteUrl(
+              p2.trim(),
+              pageUrl,
+              publicOrigin
+            )
+          );
+        }
+      )
+    );
+  });
+
+  // fetch / XHR / WebSocket など、
+  // JavaScriptから動的にアクセスされたURLも書き換える
+  const upstreamBase =
+    JSON.stringify(pageUrl);
+
+  const allowedHostsJson =
+    JSON.stringify(ALLOWED_HOSTS);
+
+  const shim = `<script>
+(() => {
+  const UPSTREAM_BASE = ${upstreamBase};
+  const PREFIX = '/__p/';
+  const ALLOWED_HOSTS = ${allowedHostsJson};
+
+  const hostAllowed = (h) =>
+    ALLOWED_HOSTS.some(
+      base =>
+        h === base ||
+        h.endsWith('.' + base)
+    );
+
+  const rewrite = (input) => {
     try {
+      const s =
+        typeof input === 'string'
+          ? input
+          : input.url;
 
-        const requestUrl = new URL(
-            req.url,
-            `http://${req.headers.host}`
+      const u =
+        new URL(
+          s,
+          UPSTREAM_BASE
         );
 
-        // ホーム
-        if (
-            requestUrl.pathname === "/" ||
-            requestUrl.pathname === "/index.html"
-        ) {
-            return proxyRequest(
-                HOME,
-                req,
-                res
-            );
-        }
+      if (
+        u.protocol !== 'http:' &&
+        u.protocol !== 'https:'
+      ) {
+        return s;
+      }
 
-        // /proxy?url=...
-        if (requestUrl.pathname === "/proxy") {
+      if (!hostAllowed(u.hostname)) {
+        return s;
+      }
 
-            const target = requestUrl.searchParams.get("url");
-
-            if (!target) {
-                res.writeHead(400, {
-                    "Content-Type": "text/plain; charset=utf-8"
-                });
-
-                return res.end("url is required");
-            }
-
-            let targetUrl;
-
-            try {
-                targetUrl = new URL(target);
-            } catch {
-                res.writeHead(400, {
-                    "Content-Type": "text/plain; charset=utf-8"
-                });
-
-                return res.end("Invalid URL");
-            }
-
-            // HTTPSだけ許可
-            if (targetUrl.protocol !== "https:") {
-                res.writeHead(403);
-                return res.end("Only HTTPS is allowed");
-            }
-
-            // unityroom系だけ許可
-            if (!isAllowedHost(targetUrl.hostname)) {
-                res.writeHead(403, {
-                    "Content-Type": "text/plain; charset=utf-8"
-                });
-
-                return res.end("Host is not allowed");
-            }
-
-            return proxyRequest(
-                targetUrl.href,
-                req,
-                res
-            );
-        }
-
-        res.writeHead(404, {
-            "Content-Type": "text/plain; charset=utf-8"
-        });
-
-        res.end("Not Found");
-
-    } catch (err) {
-
-        console.error(err);
-
-        if (!res.headersSent) {
-            res.writeHead(500);
-        }
-
-        res.end("Internal Server Error");
+      return (
+        PREFIX +
+        u.hostname +
+        (u.pathname || '/') +
+        u.search +
+        u.hash
+      );
+    } catch {
+      return input;
     }
+  };
+
+  const absolute = (u) =>
+    u.startsWith(PREFIX)
+      ? location.origin + u
+      : u;
+
+  // fetch
+  const originalFetch =
+    window.fetch;
+
+  window.fetch = function(
+    input,
+    init
+  ) {
+    if (input instanceof Request) {
+      return originalFetch.call(
+        this,
+        new Request(
+          absolute(
+            rewrite(input.url)
+          ),
+          input
+        ),
+        init
+      );
+    }
+
+    return originalFetch.call(
+      this,
+      absolute(rewrite(input)),
+      init
+    );
+  };
+
+  // XMLHttpRequest
+  const originalOpen =
+    XMLHttpRequest.prototype.open;
+
+  XMLHttpRequest.prototype.open =
+    function(
+      method,
+      url,
+      ...rest
+    ) {
+      return originalOpen.call(
+        this,
+        method,
+        absolute(rewrite(url)),
+        ...rest
+      );
+    };
+
+  // WebSocket
+  const OriginalWebSocket =
+    window.WebSocket;
+
+  if (OriginalWebSocket) {
+    window.WebSocket = function(
+      url,
+      protocols
+    ) {
+      const rewritten =
+        absolute(rewrite(url));
+
+      return protocols === undefined
+        ? new OriginalWebSocket(
+            rewritten
+          )
+        : new OriginalWebSocket(
+            rewritten,
+            protocols
+          );
+    };
+
+    window.WebSocket.prototype =
+      OriginalWebSocket.prototype;
+
+    window.WebSocket.CONNECTING =
+      OriginalWebSocket.CONNECTING;
+
+    window.WebSocket.OPEN =
+      OriginalWebSocket.OPEN;
+
+    window.WebSocket.CLOSING =
+      OriginalWebSocket.CLOSING;
+
+    window.WebSocket.CLOSED =
+      OriginalWebSocket.CLOSED;
+  }
+})();
+</script>`;
+
+  $('head').prepend(shim);
+
+  return $.html();
+}
+
+function copyResponseHeaders(
+  upstream,
+  res,
+  targetUrl
+) {
+  const skip = new Set([
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'content-length',
+    'content-encoding'
+  ]);
+
+  for (const [key, value] of upstream.headers) {
+    if (skip.has(key.toLowerCase())) {
+      continue;
+    }
+
+    // Redirect先もRender側に変更
+    if (key.toLowerCase() === 'location') {
+      try {
+        const location =
+          new URL(
+            value,
+            targetUrl
+          );
+
+        if (
+          (location.protocol === 'http:' ||
+           location.protocol === 'https:') &&
+          isAllowedHost(location.hostname)
+        ) {
+          res.setHeader(
+            'Location',
+            proxyUrl(
+              location,
+              getPublicOrigin(res.req)
+            )
+          );
+        } else {
+          res.setHeader(
+            key,
+            value
+          );
+        }
+      } catch {
+        res.setHeader(
+          key,
+          value
+        );
+      }
+
+      continue;
+    }
+
+    if (
+      key.toLowerCase() === 'set-cookie'
+    ) {
+      continue;
+    }
+
+    res.setHeader(
+      key,
+      value
+    );
+  }
+
+  // CookieをRenderドメインで使えるようにする
+  const cookies =
+    typeof upstream.headers.getSetCookie ===
+    'function'
+      ? upstream.headers.getSetCookie()
+      : [];
+
+  for (const cookie of cookies) {
+    const rewritten =
+      cookie
+        .replace(
+          /;\s*Domain=[^;]+/ig,
+          ''
+        )
+        .replace(
+          /;\s*Path=[^;]*/ig,
+          '; Path=/'
+        );
+
+    res.append(
+      'Set-Cookie',
+      rewritten
+    );
+  }
+}
+
+async function handleProxy(
+  req,
+  res
+) {
+  const target =
+    parseProxyTarget(req);
+
+  if (!target) {
+    return res
+      .status(400)
+      .send(
+        'Invalid or disallowed proxy target'
+      );
+  }
+
+  const headers = {
+    ...req.headers
+  };
+
+  delete headers.host;
+  delete headers.connection;
+  delete headers['content-length'];
+
+  // Render側のOrigin/Refererを
+  // unityroom側にそのまま送らない
+  delete headers.origin;
+  delete headers.referer;
+
+  let body;
+
+  if (
+    req.method !== 'GET' &&
+    req.method !== 'HEAD'
+  ) {
+    const chunks = [];
+
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+
+    body = Buffer.concat(chunks);
+  }
+
+  let upstream;
+
+  try {
+    upstream = await fetch(
+      target,
+      {
+        method: req.method,
+        headers,
+        body,
+        redirect: 'manual',
+        signal:
+          AbortSignal.timeout(30000)
+      }
+    );
+  } catch (error) {
+    console.error(
+      'Upstream fetch failed:',
+      target.href,
+      error
+    );
+
+    return res
+      .status(502)
+      .send(
+        `Upstream request failed: ${error.message}`
+      );
+  }
+
+  copyResponseHeaders(
+    upstream,
+    res,
+    target
+  );
+
+  res.status(
+    upstream.status
+  );
+
+  // Redirect
+  if (
+    upstream.status >= 300 &&
+    upstream.status < 400
+  ) {
+    return res.end();
+  }
+
+  const contentType =
+    (
+      upstream.headers.get(
+        'content-type'
+      ) || ''
+    ).toLowerCase();
+
+  const isText =
+    contentType.includes(
+      'text/html'
+    ) ||
+    contentType.includes(
+      'text/css'
+    );
+
+  // HTML/CSSだけメモリに読み込んでURLを書き換える
+  // Unityの大きな.data / .wasmなどはストリーミング
+  if (isText) {
+    const text =
+      await upstream.text();
+
+    const publicOrigin =
+      getPublicOrigin(req);
+
+    const rewritten =
+      contentType.includes(
+        'text/html'
+      )
+        ? rewriteHtml(
+            text,
+            target.href,
+            publicOrigin
+          )
+        : rewriteCss(
+            text,
+            target.href,
+            publicOrigin
+          );
+
+    res.removeHeader(
+      'content-length'
+    );
+
+    return res.send(
+      rewritten
+    );
+  }
+
+  if (!upstream.body) {
+    return res.end();
+  }
+
+  Readable
+    .fromWeb(upstream.body)
+    .pipe(res);
+}
+
+// トップページ
+app.get('/', (req, res) => {
+  res.redirect(
+    '/__p/unityroom.com/'
+  );
 });
 
-async function proxyRequest(target, req, res) {
+// プロキシ
+app.all(
+  /^\/__p\//,
+  (req, res) => {
+    handleProxy(
+      req,
+      res
+    ).catch(err => {
+      console.error(err);
 
-    console.log(`${req.method} ${target}`);
+      if (!res.headersSent) {
+        res
+          .status(500)
+          .send('Proxy error');
+      } else {
+        res.end();
+      }
+    });
+  }
+);
 
+app.get(
+  '/health',
+  (_req, res) =>
+    res.type('text/plain').send('ok')
+);
+
+const server =
+  http.createServer(app);
+
+// WebSocket用
+const wsProxy =
+  httpProxy.createProxyServer({
+    ws: true
+  });
+
+server.on(
+  'upgrade',
+  (req, socket, head) => {
     try {
+      const fakeReq = {
+        originalUrl: req.url
+      };
 
-        const targetUrl = new URL(target);
-
-        if (!isAllowedHost(targetUrl.hostname)) {
-            res.writeHead(403);
-            return res.end("Host is not allowed");
-        }
-
-        const headers = {
-            "user-agent":
-                req.headers["user-agent"] ||
-                "Mozilla/5.0",
-            "accept":
-                req.headers["accept"] ||
-                "*/*",
-            "accept-language":
-                req.headers["accept-language"] ||
-                "ja,en-US;q=0.9,en;q=0.8"
-        };
-
-        // Refererを送る
-        headers.referer = targetUrl.origin + "/";
-
-        const response = await fetch(targetUrl.href, {
-            method: req.method,
-            headers,
-            redirect: "manual"
-        });
-
-        // リダイレクト
-        if (
-            response.status >= 300 &&
-            response.status < 400
-        ) {
-
-            const location = response.headers.get("location");
-
-            if (location) {
-
-                const absolute = new URL(
-                    location,
-                    targetUrl
-                );
-
-                if (isAllowedHost(absolute.hostname)) {
-
-                    res.writeHead(response.status, {
-                        "Location":
-                            proxyUrl(absolute.href)
-                    });
-
-                    return res.end();
-                }
-            }
-        }
-
-        const contentType =
-            response.headers.get("content-type") || "";
-
-        const buffer =
-            Buffer.from(await response.arrayBuffer());
-
-        let body = buffer;
-
-        // HTML
-        if (
-            contentType.includes("text/html")
-        ) {
-
-            const html =
-                buffer.toString("utf8");
-
-            const rewritten =
-                rewriteHtml(
-                    html,
-                    targetUrl.href
-                );
-
-            body =
-                Buffer.from(rewritten);
-        }
-
-        // CSS
-        else if (
-            contentType.includes("text/css")
-        ) {
-
-            const css =
-                buffer.toString("utf8");
-
-            const rewritten =
-                rewriteCss(
-                    css,
-                    targetUrl.href
-                );
-
-            body =
-                Buffer.from(rewritten);
-        }
-
-        // ヘッダー
-        const responseHeaders = {
-            "Content-Type":
-                contentType ||
-                "application/octet-stream",
-
-            "Cache-Control":
-                "public, max-age=300",
-
-            "Access-Control-Allow-Origin":
-                "*"
-        };
-
-        // Content-Length
-        responseHeaders["Content-Length"] =
-            body.length;
-
-        res.writeHead(
-            response.status,
-            responseHeaders
+      const target =
+        parseProxyTarget(
+          fakeReq
         );
 
-        res.end(body);
+      if (!target) {
+        return socket.destroy();
+      }
 
+      req.url =
+        `${target.pathname || '/'}` +
+        `${target.search || ''}`;
+
+      wsProxy.ws(
+        req,
+        socket,
+        head,
+        {
+          target:
+            `wss://${target.hostname}`,
+          changeOrigin: true,
+          secure: true
+        }
+      );
     } catch (err) {
+      console.error(
+        'WebSocket proxy failed:',
+        err
+      );
 
-        console.error(
-            "Proxy error:",
-            err
-        );
-
-        if (!res.headersSent) {
-
-            res.writeHead(502, {
-                "Content-Type":
-                    "text/plain; charset=utf-8"
-            });
-
-            res.end(
-                "Proxy Error\n\n" +
-                err.message
-            );
-        }
+      socket.destroy();
     }
-}
+  }
+);
+
+// Render用
+const port =
+  Number(process.env.PORT) ||
+  10000;
 
 server.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
-
-        console.log(
-            `Proxy running on 0.0.0.0:${PORT}`
-        );
-    }
+  port,
+  '0.0.0.0',
+  () => {
+    console.log(
+      `Unityroom proxy listening on 0.0.0.0:${port}`
+    );
+  }
 );

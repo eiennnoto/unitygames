@@ -1,0 +1,16 @@
+{
+  "name": "unityroom-render-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "http-proxy": "^1.18.1"
+  }
+}
